@@ -7,6 +7,7 @@
   const SHARE_LABEL = /^share$/i;
   const SKIP = '.commentItem, .playControls, .modal, .dropdownMenu, [role="menu"], [role="dialog"]';
   const CLICKABLE = 'button, [role="button"]';
+  const MAX_WRAP_DEPTH = 3; // how many single-child wrappers around a header button to step out of
   const ARROW = 'M7 2h2v6.6l2.3-2.3 1.4 1.4L8 12.4 3.3 7.7l1.4-1.4L7 8.6V2zM3 13h10v2H3z';
   const ROLE_CLASSES = /\bsc-button-(more|like|follow|selected|repost|share|copylink|addtoset|addtonextup)\b/g;
   const pending = new Map(); // job id -> button
@@ -28,7 +29,8 @@
     const path = new URL(href, location.origin).pathname.replace(/^\/n(?=\/)/, '').replace(/\/$/, '');
     const parts = path.split('/').filter(Boolean);
     const ok = (parts.length === 2 && !RESERVED_SUB.test(parts[1])) || (parts.length === 3 && parts[1] === 'sets');
-    return ok && !RESERVED_ROOT.test(parts[0]) ? `https://soundcloud.com${path}` : null;
+    const mix = parts.length === 3 && parts[0] === 'discover' && parts[1] === 'sets'; // SoundCloud's own mixes
+    return (ok && !RESERVED_ROOT.test(parts[0])) || mix ? `https://soundcloud.com${path}` : null;
   };
 
   // The new track page is drawn inside an embedded soundcloud.com iframe (/n/pages/standby…);
@@ -120,7 +122,19 @@
     else if (msg.message) alert(msg.message);
   });
 
-  const label = (b) => (b.getAttribute('aria-label') || b.title || '').trim();
+  // Some headers (e.g. mixes) label buttons only with visible text: "Share".
+  const label = (b) => (b.getAttribute('aria-label') || b.title || b.textContent || '').trim();
+
+  // Headers space buttons in different ways (margins on one side, flex gap…); make the space after our
+  // button as wide as the space before it, so it sits evenly between its neighbours.
+  const matchGap = (btn) => {
+    const prev = btn.previousElementSibling?.getBoundingClientRect();
+    const own = btn.getBoundingClientRect();
+    const next = btn.nextElementSibling?.getBoundingClientRect();
+    if (!prev?.width || !own.width || !next?.width) return; // hidden layout copy: nothing to measure
+    const missing = (own.left - prev.right) - (next.left - own.right);
+    if (missing > 0) btn.style.marginRight = `${parseFloat(getComputedStyle(btn).marginRight) + missing}px`;
+  };
 
   const scan = () => {
     ensureStyle();
@@ -139,8 +153,14 @@
     if (!pageItem()) return;
     for (const share of document.querySelectorAll(CLICKABLE)) {
       if (!SHARE_LABEL.test(label(share)) || share.closest(CARD) || share.closest(SKIP)) continue;
-      if (share.previousElementSibling?.classList.contains('scdl-btn')) continue;
-      share.before(makeButton(share));
+      // Some headers (mixes) wrap each button in its own spaced box: step out to that box, so the arrow
+      // becomes a separate item in the row instead of squeezing into Share's box.
+      let slot = share;
+      for (let i = 0; i < MAX_WRAP_DEPTH && slot.parentElement?.childElementCount === 1; i++) slot = slot.parentElement;
+      if (slot.previousElementSibling?.classList.contains('scdl-btn')) continue;
+      const btn = makeButton(share);
+      slot.before(btn);
+      requestAnimationFrame(() => matchGap(btn));
     }
   };
 

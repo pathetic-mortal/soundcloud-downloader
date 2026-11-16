@@ -80,6 +80,23 @@ const startJob = async (job, tabId) => {
   return { id: full.id };
 };
 
+// Chrome's "file downloaded" bubble takes focus and closes the menu after every track,
+// so it is hidden while our downloads run and turned back on when they finish or stop.
+const setDownloadBubble = (enabled) => chrome.downloads.setUiOptions({ enabled }).catch(() => {});
+chrome.runtime.onStartup.addListener(() => setDownloadBubble(true)); // never leave it off after a crash/restart
+
+// Opens the toolbar menu by itself; "?auto" tells that copy to close once nothing is downloading.
+const showMenu = async () => {
+  try {
+    await chrome.action.setPopup({ popup: 'popup.html?auto' });
+    await chrome.action.openPopup();
+  } catch {
+    // No focused Chrome window (or Chrome older than 127): the download just runs without the menu.
+  } finally {
+    await chrome.action.setPopup({ popup: 'popup.html' });
+  }
+};
+
 const toTab = (job, msg) => job.tabId && chrome.tabs.sendMessage(job.tabId, { ...msg, id: job.id, fromButton: job.fromButton }).catch(() => {});
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -89,6 +106,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     save: () => saveFile(msg),
     listPlaylists,
     createPlaylist: () => createPlaylist(msg),
+    // A queued download really started (not just queued): show the menu with its progress panel.
+    started: async () => {
+      setDownloadBubble(false);
+      await chrome.storage.session.set({ status: { text: '…', title: '', kind: msg.kind } });
+      await showMenu();
+    },
     // The menu reads `status` from session storage to show what is downloading right now.
     progress: async () => {
       chrome.action.setBadgeText({ text: msg.text.split(' ')[0].slice(0, 5) });
@@ -101,6 +124,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       chrome.runtime.sendMessage({ to: 'engine', type: 'control', action: msg.action }).catch(() => {});
       const { status } = await chrome.storage.session.get('status');
       if (msg.action === 'stop') {
+        setDownloadBubble(true);
         chrome.action.setBadgeText({ text: '' });
         await chrome.storage.session.remove('status');
       } else if (status) {
@@ -109,6 +133,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
     },
     done: async () => {
+      setDownloadBubble(true);
       chrome.action.setBadgeText({ text: '' });
       chrome.storage.session.remove('status');
       toTab(msg.job, { type: 'scdl-done', error: msg.error, message: msg.message });

@@ -286,7 +286,7 @@ const JOBS = {
       await save(blob, [`${name}.mp3`]);
       return null;
     }
-    if (item.kind === 'playlist') return downloadMany(item.title, await completeTracks(item.tracks), progress, { numbered: true, album: item.title });
+    if (item.kind === 'playlist' || item.kind === 'system-playlist') return downloadMany(item.title, await completeTracks(item.tracks), progress, { numbered: true, album: item.title });
     if (item.kind === 'user') return downloadMany(item.username, await artistTracks(item, progress), progress);
     throw new Error('Не понял, что это за ссылка.');
   },
@@ -354,6 +354,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const progress = (text, title) => toBg({ type: 'progress', job: ref, text, title, kind: job.kind });
     try {
       await gate();
+      await toBg({ type: 'started', job: ref, kind: job.kind });
       const message = await JOBS[job.kind](job, progress);
       await toBg({ type: 'done', job: ref, message: [message, folderWarning].filter(Boolean).join('\n\n') || null });
     } catch (e) {

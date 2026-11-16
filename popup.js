@@ -2,6 +2,8 @@ const $ = (id) => document.getElementById(id);
 const RESERVED_ROOT = /^(you|discover|search|charts|pages|stations|upload|settings|messages|notifications|feed|people|tags|jobs|imprint|terms-of-use)$/;
 const SC_URL = /^https:\/\/(m\.)?soundcloud\.com\//;
 const PICKER_SIZE = { width: 400, height: 320 };
+const AUTO_OPENED = new URLSearchParams(location.search).has('auto'); // set by background.js showMenu()
+const AUTO_CLOSE_DELAY_MS = 350; // a bit longer than the panel's slide-out
 const KIND_LABEL = {
   url: 'Скачивается',
   artistTracks: 'Скачиваются песни исполнителя',
@@ -71,11 +73,15 @@ const init = async () => {
   const control = (action) => chrome.runtime.sendMessage({ to: 'bg', type: 'control', action });
   $('now-pause').addEventListener('click', () => control($('now-pause').dataset.action || 'pause'));
   $('now-stop').addEventListener('click', () => control('stop'));
+  $('now-hide').addEventListener('click', () => window.close()); // the download keeps running
 
   const { status: now } = await chrome.storage.session.get('status');
   renderNow(now);
   chrome.storage.session.onChanged.addListener((changes) => {
-    if (changes.status) renderNow(changes.status.newValue);
+    if (!changes.status) return;
+    renderNow(changes.status.newValue);
+    // Opened by the extension itself when a download started: close once it ends, after the panel slides out.
+    if (AUTO_OPENED && !changes.status.newValue) setTimeout(() => window.close(), AUTO_CLOSE_DELAY_MS);
   });
 
   const jobFor = {
