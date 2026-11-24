@@ -1,6 +1,6 @@
 // Offscreen document: talks to the SoundCloud API, builds tagged MP3s and hands blob URLs to background.js to save.
 const API = 'https://api-v2.soundcloud.com';
-const MP3_KBPS = 256;
+const MP3_KBPS = 320; // re-encoding keeps everything a 256 kbps HQ source has
 const ENCODE_BLOCK = 1152 * 200; // samples per encoder call; yield between blocks
 const IDS_PER_REQUEST = 50;
 const PAGE_SIZE = 200;
@@ -120,8 +120,37 @@ const likedTracks = async (progress) => {
 };
 
 const isMp3 = (t) => t.format.mime_type.startsWith('audio/mpeg');
-// Plain (non-DRM) streams, best first: mp3 file, mp3 HLS, then aac / opus that get re-encoded to mp3.
-const rank = (t) => (t.format.protocol === 'progressive' ? 0 : 1) + (isMp3(t) ? 0 : t.format.mime_type.startsWith('audio/mp4') ? 2 : 4);
+
+// Reads a response body while reporting progress (originals can be large WAV/FLAC files).
+const readAll = async (r, progress) => {
+  const total = Number(r.headers.get('content-length')) || 0;
+  const reader = r.body.getReader();
+  const parts = [];
+  let got = 0;
+  for (;;) {
+    await gate();
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value);
+    got += value.length;
+    if (total) progress(got / total);
+  }
+  return new Uint8Array(await new Blob(parts).arrayBuffer());
+};
+
+// The author's own upload (often WAV/FLAC/320) when they allow downloads; null → use the stream instead.
+const fetchOriginal = async (track, progress) => {
+  if (!track.downloadable || track.has_downloads_left === false) return null;
+  try {
+    const { redirectUri } = await api(`/tracks/${track.id}/download`);
+    const bytes = await readAll(await fetchOk(redirectUri), progress);
+    const type = scdlSniffAudio(bytes);
+    return type ? { bytes, type } : null;
+  } catch (e) {
+    if (isStop(e)) throw e;
+    return null; // download limit, other host, error page… the stream still works
+  }
+};
 
 const fetchStream = async (t, track, progress) => {
   const u = new URL(t.url);
@@ -167,16 +196,41 @@ const fetchCover = async (track) => {
   return { mime: r.headers.get('content-type') || 'image/jpeg', data: new Uint8Array(await r.arrayBuffer()) };
 };
 
-const buildMp3 = async (track, progress, extra = {}) => {
+// Best audio we may legally take: the original upload if the author allows it, otherwise the
+// highest-quality unencrypted stream (HQ for Go+ accounts), as mp3. Returns { blob, name, ext }.
+const buildFile = async (track, progress, extra = {}) => {
   if (track.policy === 'SNIP') throw new Error('только по подписке Go+ (доступно лишь превью)');
+  const pct = (f) => progress(`${Math.round(f * 100)}%`);
+  const meta = track.publisher_metadata || {};
+  const { artist, title } = scdlTrackMeta(track.title, meta.artist || track.user?.username || 'unknown');
+  const name = `${artist} - ${title}`;
+  const tags = {
+    title,
+    artist,
+    album: meta.album_title || extra.album,
+    track: extra.trackNo,
+    year: (track.release_date || track.display_date || track.created_at || '').slice(0, 4),
+    genre: track.genre,
+    publisher: meta.publisher || track.label_name,
+    isrc: meta.isrc,
+    comment: track.description,
+    url: track.permalink_url,
+    cover: await fetchCover(track).catch(() => null), // a missing cover shouldn't cost the whole download
+  };
+
+  const original = await fetchOriginal(track, pct);
+  if (original?.type === 'mp3') {
+    return { blob: new Blob([scdlId3(tags), scdlStripId3(original.bytes)], { type: 'audio/mpeg' }), name, ext: 'mp3' };
+  }
+  if (original) return { blob: new Blob([original.bytes]), name, ext: original.type }; // lossless etc. keeps its own tags
+
   const candidates = (track.media?.transcodings || [])
     .filter((t) => ['progressive', 'hls'].includes(t.format.protocol)) // encrypted (DRM) streams are skipped
-    .sort((a, b) => rank(a) - rank(b));
+    .sort((a, b) => scdlStreamScore(b) - scdlStreamScore(a));
   if (!candidates.length) throw new Error('защищён DRM');
 
   // SoundCloud retired some stream types (they 404), so fall through to the next one.
   // One bar per track: download (and, if needed, mp3 encoding after it) report fractions of the same 0–100%.
-  const pct = (f) => progress(`${Math.round(f * 100)}%`);
   let mp3; let lastError;
   for (const t of candidates) {
     try {
@@ -190,23 +244,7 @@ const buildMp3 = async (track, progress, extra = {}) => {
     }
   }
   if (!mp3) throw lastError;
-
-  const meta = track.publisher_metadata || {};
-  const { artist, title } = scdlTrackMeta(track.title, meta.artist || track.user?.username || 'unknown');
-  const tag = scdlId3({
-    title,
-    artist,
-    album: meta.album_title || extra.album,
-    track: extra.trackNo,
-    year: (track.release_date || track.display_date || track.created_at || '').slice(0, 4),
-    genre: track.genre,
-    publisher: meta.publisher || track.label_name,
-    isrc: meta.isrc,
-    comment: track.description,
-    url: track.permalink_url,
-    cover: await fetchCover(track).catch(() => null), // a missing cover shouldn't cost the whole download
-  });
-  return { blob: new Blob([tag, mp3], { type: 'audio/mpeg' }), name: `${artist} - ${title}` };
+  return { blob: new Blob([scdlId3(tags), mp3], { type: 'audio/mpeg' }), name, ext: 'mp3' };
 };
 
 let folderWarning = null; // set once per job when the picked folder can't be used
@@ -254,8 +292,8 @@ const downloadMany = async (folder, tracks, progress, { numbered = false, album 
   for (const [i, track] of tracks.entries()) {
     await gate();
     try {
-      const { blob, name } = await buildMp3(track, (p) => progress(`${i + 1}/${tracks.length} ${p}`, track.title), { album, trackNo: numbered ? i + 1 : undefined });
-      await save(blob, [folder, `${numbered ? `${String(i + 1).padStart(pad, '0')}. ` : ''}${name}.mp3`]);
+      const { blob, name, ext } = await buildFile(track, (p) => progress(`${i + 1}/${tracks.length} ${p}`, track.title), { album, trackNo: numbered ? i + 1 : undefined });
+      await save(blob, [folder, `${numbered ? `${String(i + 1).padStart(pad, '0')}. ` : ''}${name}.${ext}`]);
     } catch (e) {
       if (isStop(e)) throw e;
       failed.push(`${i + 1}. ${track.title}: ${e.message}`);
@@ -282,8 +320,8 @@ const JOBS = {
   async url(job, progress) {
     const item = await resolve(job.url);
     if (item.kind === 'track') {
-      const { blob, name } = await buildMp3(item, (p) => progress(p, item.title));
-      await save(blob, [`${name}.mp3`]);
+      const { blob, name, ext } = await buildFile(item, (p) => progress(p, item.title));
+      await save(blob, [`${name}.${ext}`]);
       return null;
     }
     if (item.kind === 'playlist' || item.kind === 'system-playlist') return downloadMany(item.title, await completeTracks(item.tracks), progress, { numbered: true, album: item.title });

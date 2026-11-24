@@ -20,8 +20,35 @@
       id: STYLE_ID,
       // Only the icon is orange; the outline/background stay as on the neighbouring buttons.
       textContent: `.scdl-btn svg, .scdl-btn svg path { fill: #f50 !important; stroke: none !important; color: #f50 !important; }
-        .scdl-btn .scdl-progress { color: #f50; font-size: 10px; font-weight: 600; white-space: nowrap; }`,
+        .scdl-btn .scdl-progress { color: #f50; font-size: 10px; font-weight: 600; white-space: nowrap; }
+        /* Playlist page: newest added track on top. Display only, play order and downloads are unchanged. */
+        .scdl-newest .listenDetails .trackList__list { display: flex !important; flex-direction: column-reverse; }
+        .scdl-sort { margin: 0 0 10px; }`,
     }));
+  };
+
+  // Playlist order toggle, remembered across pages (default: newest first).
+  const SORT_KEY = 'scdl-newest-first';
+  const newestFirst = () => { try { return localStorage.getItem(SORT_KEY) !== '0'; } catch { return true; } };
+  const sortLabel = () => (newestFirst() ? '⇅ Oldest first' : '⇅ Newest first'); // names what a click will do
+  const applySort = () => {
+    document.documentElement.classList.toggle('scdl-newest', newestFirst());
+    const text = sortLabel();
+    // Only touch changed labels: rewriting text is a DOM mutation, which would re-trigger scan() forever.
+    document.querySelectorAll('.scdl-sort').forEach((b) => { if (b.textContent !== text) b.textContent = text; });
+  };
+  const sortButton = (list) => {
+    const btn = Object.assign(document.createElement('button'), {
+      type: 'button', className: 'sc-button sc-button-small sc-button-secondary scdl-sort', title: 'Change track order', textContent: sortLabel(),
+    });
+    // Same typeface and size as the track titles next to it.
+    const font = getComputedStyle(list.querySelector('.trackItem__trackTitle') || list);
+    for (const p of ['fontFamily', 'fontSize', 'fontWeight']) btn.style[p] = font[p];
+    btn.addEventListener('click', () => {
+      try { localStorage.setItem(SORT_KEY, newestFirst() ? '0' : '1'); } catch { /* storage blocked: order just won't be remembered */ }
+      applySort();
+    });
+    return btn;
   };
 
   const itemPath = (href) => {
@@ -138,6 +165,10 @@
 
   const scan = () => {
     ensureStyle();
+    applySort();
+    for (const list of document.querySelectorAll('.listenDetails .trackList__list')) {
+      if (!list.previousElementSibling?.classList.contains('scdl-sort')) list.before(sortButton(list));
+    }
     // Rows, tiles, queue, player: next to the card's Like button, or before "…" when there is no Like
     // (your own private playlists have no Like button).
     for (const anchor of document.querySelectorAll('button.sc-button-like, button.sc-button-more')) {
